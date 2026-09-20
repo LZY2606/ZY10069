@@ -262,7 +262,8 @@ def test_variables_typed_with_not_available_types() -> None:
 
     with pytest.raises(
         PDDLValidationError,
-        match=r"types \['t2'\] of term Variable\(x\) are not in available types \{'t1'\}",
+        match=r"types \['t2'\] of term Variable\(x\) are not in available types \{'t1'\} "
+        r"\(at line 5, column 22: 'x'\)",
     ):
         DomainParser()(domain_str)
 

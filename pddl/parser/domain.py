@@ -54,10 +54,12 @@ from pddl.logic.functions import (
 )
 from pddl.logic.predicates import DerivedPredicate, EqualTo, Predicate
 from pddl.logic.terms import Constant, Variable
+from pddl.parser import typed_lists
 from pddl.parser._update_type_tags import update_type_tags
 from pddl.parser.base import BaseParser
 from pddl.parser.symbols import BINARY_COMP_SYMBOLS, Symbols
-from pddl.parser.typed_list_parser import TypedListParser
+from pddl.parser.type_resolver import TypeResolver
+from pddl.parser.typed_lists import TypedListDiagnostic, TypedListIndex
 from pddl.requirements import Requirements, _extend_domain_requirements
 
 
@@ -75,6 +77,8 @@ class DomainTransformer(Transformer[Any, Domain]):
         self._requirements: Set[Requirements] = set()
         self._extended_requirements: Set[Requirements] = set()
         self._types: Optional[Mapping[name, Optional[name]]] = None
+        self._type_resolver = TypeResolver()
+        self._last_typed_name_locations: Dict[Any, Any] = {}
 
     @property
     def types_hierarchy(self) -> Mapping[name, Optional[name]]:
@@ -102,11 +106,22 @@ class DomainTransformer(Transformer[Any, Domain]):
                 assert_(isinstance(arg, dict))
                 kwargs.update(arg)
         kwargs.update(actions=actions, derived_predicates=derived_predicates)
+        # run deferred semantic checks (unknown types, cycles), aggregated and
+        # ordered by source position, before constructing the public object
+        self._type_resolver.finalize()
         self._types = None
         return Domain(**kwargs)
 
     def domain_def(self, args):
         """Process the 'domain_def' rule."""
+        # ``domain_def`` is the first inner callback of a document. The LALR
+        # transformer runs inner callbacks before the top-level ``domain``
+        # callback, so per-document state is reset here.
+        self._type_resolver = TypeResolver()
+        self._last_typed_name_locations = {}
+        self._types = None
+        self._requirements = set()
+        self._extended_requirements = set()
         return dict(name=args[2])
 
     def requirements(self, args):
@@ -120,6 +135,7 @@ class DomainTransformer(Transformer[Any, Domain]):
         """Parse the 'types' rule."""
         has_typing_requirement = self._has_requirement(Requirements.TYPING)
         types_definition = args[2]
+        type_locations = self._last_typed_name_locations
         have_type_hierarchy = any(types_definition.values())
         if have_type_hierarchy and not has_typing_requirement:
             raise PDDLMissingRequirementError(Requirements.TYPING)
@@ -128,17 +144,22 @@ class DomainTransformer(Transformer[Any, Domain]):
                 types_definition[k] = None
 
         # record types hierarchy for later use during the parsing
-        # safety check: make sure self._types is not set
-        assert_(self._types is None, "parser is in an unexpected state")
         self._types = types_definition
+        self._type_resolver.record_hierarchy(types_definition, type_locations)
 
         return dict(types=types_definition)
 
     def constants(self, args):
         """Process the 'constant_def' rule."""
-        self._constants_by_name = {
+        constants_by_name = {
             name: Constant(name, type_tags) for name, type_tags in args[2].items()
         }
+        constant_locations = self._last_typed_name_locations
+        for constant_name, constant in constants_by_name.items():
+            self._type_resolver.record_term(
+                constant, constant_locations.get(constant_name)
+            )
+        self._constants_by_name = constants_by_name
         return dict(constants=list(self._constants_by_name.values()))
 
     def predicates(self, args):
@@ -222,9 +243,14 @@ class DomainTransformer(Transformer[Any, Domain]):
 
     def action_parameters(self, args):
         """Process the 'action_parameters' rule."""
-        self._current_parameters_by_name = {
-            var_name: Variable(var_name, tags) for var_name, tags in args[1]
-        }
+        variable_pairs = args[1]
+        self._current_parameters_by_name = {}
+        for entry in variable_pairs:
+            location = entry[2] if len(entry) == 3 else None
+            var_name, tags = entry[0], entry[1]
+            variable = Variable(var_name, tags)
+            self._type_resolver.record_term(variable, location)
+            self._current_parameters_by_name[var_name] = variable
         return list(self._current_parameters_by_name.values())
 
     def emptyor_pregd(self, args):
@@ -287,7 +313,7 @@ class DomainTransformer(Transformer[Any, Domain]):
             & self._extended_requirements
         ):
             raise PDDLMissingRequirementError(req)
-        variables = [Variable(var_name, tags) for var_name, tags in args[3]]
+        variables = self._variables_from_pairs(args[3])
         condition = args[5]
         return cond_class(cond=condition, variables=variables)
 
@@ -352,7 +378,7 @@ class DomainTransformer(Transformer[Any, Domain]):
         if len(args) == 1:
             return args[0]
         if args[1] == Symbols.FORALL.value:
-            variables = [Variable(var_name, tags) for var_name, tags in args[3]]
+            variables = self._variables_from_pairs(args[3])
             return Forall(effect=args[-2], variables=variables)
         if args[1] == Symbols.WHEN.value:
             return When(args[2], args[3])
@@ -422,10 +448,27 @@ class DomainTransformer(Transformer[Any, Domain]):
 
     def _formula_skeleton(self, args) -> Sequence[Variable]:
         """Process the '_formula_skeleton' rule."""
-        variable_data: Tuple[Tuple[str, Set[str]], ...] = args[2]
-        variables: List[Variable] = [
-            Variable(var_name, tags) for var_name, tags in variable_data
-        ]
+        return self._variables_from_pairs(args[2])
+
+    def _variables_from_pairs(
+        self, variable_data: Sequence[Tuple[Any, Any]]
+    ) -> List[Variable]:
+        """Build Variables from typed-list pairs.
+
+        Pairs coming straight from the shared parser machinery carry source
+        locations (``(value, tags, location)`` triples); pairs produced by
+        other code paths are plain ``(value, tags)`` tuples.
+        """
+        variables: List[Variable] = []
+        for entry in variable_data:
+            location = None
+            if len(entry) == 3:
+                var_name, tags, location = entry
+            else:
+                var_name, tags = entry
+            variable = Variable(var_name, tags)
+            self._type_resolver.record_term(variable, location)
+            variables.append(variable)
         return variables
 
     def atomic_formula_skeleton(self, args):
@@ -474,44 +517,75 @@ class DomainTransformer(Transformer[Any, Domain]):
         variables = list(map(self._constant_or_variable, args[2:-1]))
         return NumericFunction(function_name, *variables)
 
+    def _build_typed_list_name(self, args) -> Tuple[TypedListIndex, Dict[Any, Any]]:
+        """Build a name typed list through the shared internal machinery."""
+        return self._build_typed_list(args, allow_duplicates=False)
+
+    def _build_typed_list_variable(self, args) -> Tuple[TypedListIndex, Dict[Any, Any]]:
+        """Build a variable typed list through the shared internal machinery."""
+        return self._build_typed_list(args, allow_duplicates=True)
+
+    def _build_typed_list(
+        self, args, allow_duplicates: bool
+    ) -> Tuple[TypedListIndex, Dict[Any, Any]]:
+        """Group and index a typed list, sharing boundary rules with all entries."""
+        index = TypedListIndex(allow_duplicates=allow_duplicates)
+        locations: Dict[Any, Any] = {}
+        try:
+            for item in typed_lists.iter_typed_items(args):
+                index.add(item)
+                if item.location is not None and item.value not in locations:
+                    locations[item.value] = item.location
+        except TypedListDiagnostic as diagnostic:
+            raise self._typed_list_parsing_error(args, diagnostic)
+        return index, locations
+
     def typed_list_name(self, args) -> Dict[name, Optional[name]]:
         """Process the 'typed_list_name' rule."""
+        index, locations = self._build_typed_list_name(args)
         try:
-            types_index = TypedListParser.parse_typed_list(args)
-            return types_index.get_typed_list_of_names()
-        except ValueError as e:
-            raise self._raise_typed_list_parsing_error(args, e) from e
+            result = index.names()
+        except TypedListDiagnostic as diagnostic:
+            raise self._typed_list_parsing_error(args, diagnostic)
+        self._last_typed_name_locations = locations
+        return result
 
-    def typed_list_variable(self, args) -> Tuple[Tuple[name, Set[name]], ...]:
+    def typed_list_variable(self, args) -> Tuple[Tuple[Any, Set[name], Any], ...]:
         """
         Process the 'typed_list_variable' rule.
 
-        Return a dictionary with as keys the terms and as value a set of types for each name.
+        Return a tuple of ``(variable, type tags, source location)`` triples.
+        The source location is internal metadata used by the shared type
+        resolution; consumers only read the first two elements.
 
         :param args: the argument of this grammar rule
-        :return: a typed list (variable), i.e. a mapping from variables to the supported types
+        :return: a typed list (variable) with source locations
         """
+        index, _ = self._build_typed_list_variable(args)
         try:
-            types_index = TypedListParser.parse_typed_list(args, allow_duplicates=True)
-            return types_index.get_typed_list_of_variables()
-        except ValueError as e:
-            raise self._raise_typed_list_parsing_error(args, e) from e
+            return index.variables()
+        except TypedListDiagnostic as diagnostic:
+            raise self._typed_list_parsing_error(args, diagnostic)
 
     def f_typed_list_atomic_function_skeleton(self, args):
         """Process the 'f_typed_list_atomic_function_skeleton' rule."""
+        index, _locations = self._build_typed_list_name(args)
         try:
-            types_index = TypedListParser.parse_typed_list(args)
-            return types_index.get_typed_list_of_names()
-        except ValueError as e:
-            raise self._raise_typed_list_parsing_error(args, e) from e
+            return index.names()
+        except TypedListDiagnostic as diagnostic:
+            raise self._typed_list_parsing_error(args, diagnostic)
 
-    def _raise_typed_list_parsing_error(self, args, exception) -> PDDLParsingError:
+    def _typed_list_parsing_error(
+        self, args, diagnostic: TypedListDiagnostic
+    ) -> PDDLParsingError:
+        """Build the historical parsing error, with a source-location suffix."""
         string_list = [
             str(arg) if isinstance(arg, str) else list(map(str, arg)) for arg in args
         ]
-        return PDDLParsingError(
-            f"error while parsing tokens {string_list}: {str(exception)}"
-        )
+        message = f"error while parsing tokens {string_list}: {diagnostic.message}"
+        if diagnostic.location is not None:
+            message = f"{message} ({diagnostic.location.format()})"
+        return PDDLParsingError(message)
 
     def type_def(self, args):
         """Parse the 'type_def' rule."""
