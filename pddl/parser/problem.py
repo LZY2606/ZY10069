@@ -12,7 +12,7 @@
 
 """Implementation of the PDDL problem parser."""
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from lark import ParseError, Transformer
 
@@ -48,6 +48,16 @@ class ProblemTransformer(Transformer[Any, Problem]):
 
         self._domain_transformer = DomainTransformer()
         self._objects_by_name: Dict[str, Constant] = {}
+
+    @property
+    def source_text(self) -> Optional[str]:
+        """Get the input text being parsed (used for diagnostics)."""
+        return self._domain_transformer.source_text
+
+    @source_text.setter
+    def source_text(self, source_text: Optional[str]) -> None:
+        """Set the input text being parsed, forwarding it to the shared transformer."""
+        self._domain_transformer.source_text = source_text
 
     def start(self, args):
         """Process the rule 'start'."""

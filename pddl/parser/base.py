@@ -43,6 +43,11 @@ class BaseParser(Transformer[Any, T], ABC):
 
     def __call__(self, text: str) -> T:
         """Call."""
+        # make the input text available to the transformer, so that
+        # diagnostics can be anchored to the user input (best effort:
+        # only transformers that declare a 'source_text' attribute use it)
+        if hasattr(self._transformer, "source_text"):
+            self._transformer.source_text = text
         return self._call_parser(text, self._parser)
 
     @classmethod

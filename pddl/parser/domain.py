@@ -30,7 +30,11 @@ from lark import ParseError, Transformer
 from pddl.action import Action
 from pddl.core import Domain
 from pddl.custom_types import name
-from pddl.exceptions import PDDLMissingRequirementError, PDDLParsingError
+from pddl.exceptions import (
+    PDDLMissingRequirementError,
+    PDDLParsingError,
+    PDDLValidationError,
+)
 from pddl.helpers.base import assert_
 from pddl.logic.base import And, ExistsCondition, ForallCondition, Imply, Not, OneOf, Or
 from pddl.logic.effects import Forall, When
@@ -57,7 +61,7 @@ from pddl.logic.terms import Constant, Variable
 from pddl.parser._update_type_tags import update_type_tags
 from pddl.parser.base import BaseParser
 from pddl.parser.symbols import BINARY_COMP_SYMBOLS, Symbols
-from pddl.parser.typed_list_parser import TypedListParser
+from pddl.parser.typed_list_parser import TypedListParser, TypeResolver
 from pddl.requirements import Requirements, _extend_domain_requirements
 
 
@@ -68,6 +72,7 @@ class DomainTransformer(Transformer[Any, Domain]):
         """Initialize the domain transformer."""
         super().__init__(*args, **kwargs)
 
+        self.source_text: Optional[str] = None
         self._constants_by_name: Dict[str, Constant] = {}
         self._predicates_by_name: Dict[str, Predicate] = {}
         self._functions_by_name: Dict[str, FunctionExpression] = {}
@@ -75,6 +80,28 @@ class DomainTransformer(Transformer[Any, Domain]):
         self._requirements: Set[Requirements] = set()
         self._extended_requirements: Set[Requirements] = set()
         self._types: Optional[Mapping[name, Optional[name]]] = None
+        self._reset_typed_list_state()
+
+    def _reset_typed_list_state(self) -> None:
+        """Reset the per-parse bookkeeping of the shared typed-list mechanism."""
+        # typed lists whose type tags are also checked at domain construction
+        # time; pairs of (typed list, item kind), used for diagnostics
+        self._checked_typed_lists: List[Tuple[TypedListParser, str]] = []
+        # typed-list parsers keyed by the id of their (transformed) result, so
+        # that the grammar rules consuming the result can recover the parser
+        self._typed_list_parsers: Dict[int, TypedListParser] = {}
+        # the typed list the types hierarchy was declared in (for positions)
+        self._types_list_parser: Optional[TypedListParser] = None
+
+    def _register_typed_list(self, result: Any, parser: TypedListParser) -> None:
+        """Associate a typed-list parser to its transformed result."""
+        self._typed_list_parsers[id(result)] = parser
+
+    def _register_checked_typed_list(self, result: Any, kind: str) -> None:
+        """Mark the typed list that produced 'result' as subject to type resolution."""
+        parser = self._typed_list_parsers.get(id(result))
+        if parser is not None:
+            self._checked_typed_lists.append((parser, kind))
 
     @property
     def types_hierarchy(self) -> Mapping[name, Optional[name]]:
@@ -102,12 +129,57 @@ class DomainTransformer(Transformer[Any, Domain]):
                 assert_(isinstance(arg, dict))
                 kwargs.update(arg)
         kwargs.update(actions=actions, derived_predicates=derived_predicates)
+        types_hierarchy = self._types
         self._types = None
-        return Domain(**kwargs)
+        try:
+            return Domain(**kwargs)
+        except PDDLValidationError as error:
+            # the domain object validation is the authoritative check; here we
+            # only enrich type-resolution errors (unknown types, inheritance
+            # cycles) with source positions, without changing the error type
+            raise self._enrich_type_resolution_error(
+                error, types_hierarchy
+            ) from error
 
     def domain_def(self, args):
         """Process the 'domain_def' rule."""
+        self._reset_typed_list_state()
         return dict(name=args[2])
+
+    def _enrich_type_resolution_error(
+        self, error: PDDLValidationError, types_hierarchy
+    ) -> PDDLValidationError:
+        """
+        Attach source positions to type-resolution errors, when possible.
+
+        The check itself is not anticipated: it already failed during the
+        construction of the domain object. If the error is not a
+        type-resolution error, or no position information is available, the
+        original error is returned unchanged.
+        """
+        message = str(error)
+        resolver = TypeResolver(
+            types_hierarchy,
+            types_list=self._types_list_parser,
+            source=self.source_text,
+        )
+        if "cycle detected in the type hierarchy" in message:
+            diagnostics = resolver.cycle_diagnostics()
+            header = "type declarations involved in the cycle"
+        elif "are not in available types" in message:
+            diagnostics = resolver.unknown_type_diagnostics(self._checked_typed_lists)
+            header = "unknown types detected"
+        else:
+            return error
+        if not diagnostics:
+            return error
+        details = "\n".join(
+            f"{index}) {diagnostic}"
+            for index, diagnostic in enumerate(diagnostics, start=1)
+        )
+        return PDDLValidationError(
+            f"{message}\n{header} (sorted by source position):\n{details}"
+        )
 
     def requirements(self, args):
         """Process the 'requirements' rule."""
@@ -131,11 +203,13 @@ class DomainTransformer(Transformer[Any, Domain]):
         # safety check: make sure self._types is not set
         assert_(self._types is None, "parser is in an unexpected state")
         self._types = types_definition
+        self._types_list_parser = self._typed_list_parsers.get(id(args[2]))
 
         return dict(types=types_definition)
 
     def constants(self, args):
         """Process the 'constant_def' rule."""
+        self._register_checked_typed_list(args[2], "constant")
         self._constants_by_name = {
             name: Constant(name, type_tags) for name, type_tags in args[2].items()
         }
@@ -222,6 +296,7 @@ class DomainTransformer(Transformer[Any, Domain]):
 
     def action_parameters(self, args):
         """Process the 'action_parameters' rule."""
+        self._register_checked_typed_list(args[1], "variable")
         self._current_parameters_by_name = {
             var_name: Variable(var_name, tags) for var_name, tags in args[1]
         }
@@ -287,6 +362,7 @@ class DomainTransformer(Transformer[Any, Domain]):
             & self._extended_requirements
         ):
             raise PDDLMissingRequirementError(req)
+        self._register_checked_typed_list(args[3], "variable")
         variables = [Variable(var_name, tags) for var_name, tags in args[3]]
         condition = args[5]
         return cond_class(cond=condition, variables=variables)
@@ -352,6 +428,7 @@ class DomainTransformer(Transformer[Any, Domain]):
         if len(args) == 1:
             return args[0]
         if args[1] == Symbols.FORALL.value:
+            self._register_checked_typed_list(args[3], "variable")
             variables = [Variable(var_name, tags) for var_name, tags in args[3]]
             return Forall(effect=args[-2], variables=variables)
         if args[1] == Symbols.WHEN.value:
@@ -430,6 +507,7 @@ class DomainTransformer(Transformer[Any, Domain]):
 
     def atomic_formula_skeleton(self, args):
         """Process the 'atomic_formula_skeleton' rule."""
+        self._register_checked_typed_list(args[2], "variable")
         predicate_name = args[1]
         variables = self._formula_skeleton(args)
         return Predicate(predicate_name, *variables)
@@ -477,10 +555,14 @@ class DomainTransformer(Transformer[Any, Domain]):
     def typed_list_name(self, args) -> Dict[name, Optional[name]]:
         """Process the 'typed_list_name' rule."""
         try:
-            types_index = TypedListParser.parse_typed_list(args)
-            return types_index.get_typed_list_of_names()
+            types_index = TypedListParser.parse_typed_list(
+                args, source=self.source_text
+            )
+            result = types_index.get_typed_list_of_names()
         except ValueError as e:
             raise self._raise_typed_list_parsing_error(args, e) from e
+        self._register_typed_list(result, types_index)
+        return result
 
     def typed_list_variable(self, args) -> Tuple[Tuple[name, Set[name]], ...]:
         """
@@ -492,15 +574,21 @@ class DomainTransformer(Transformer[Any, Domain]):
         :return: a typed list (variable), i.e. a mapping from variables to the supported types
         """
         try:
-            types_index = TypedListParser.parse_typed_list(args, allow_duplicates=True)
-            return types_index.get_typed_list_of_variables()
+            types_index = TypedListParser.parse_typed_list(
+                args, allow_duplicates=True, source=self.source_text
+            )
+            result = types_index.get_typed_list_of_variables()
         except ValueError as e:
             raise self._raise_typed_list_parsing_error(args, e) from e
+        self._register_typed_list(result, types_index)
+        return result
 
     def f_typed_list_atomic_function_skeleton(self, args):
         """Process the 'f_typed_list_atomic_function_skeleton' rule."""
         try:
-            types_index = TypedListParser.parse_typed_list(args)
+            types_index = TypedListParser.parse_typed_list(
+                args, source=self.source_text
+            )
             return types_index.get_typed_list_of_names()
         except ValueError as e:
             raise self._raise_typed_list_parsing_error(args, e) from e
